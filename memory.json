@@ -1,0 +1,32 @@
+{
+  "episodic": {
+    "session_1": {
+      "date": "Monday, November 3, 2025",
+      "turns": 6
+    },
+    "session_2": {
+      "date": "Thursday, November 6, 2025",
+      "turns": 2
+    }
+  },
+  "semantic": {
+    "commitments": [
+      "Reduce food delivery spending to ₹6,445 this month.",
+      "Transfer ₹30,000 to house fund by November 25, 2025."
+    ],
+    "goals": [
+      "Save ₹15 lakh in 2 years for a house down payment in Bangalore.",
+      "Save ₹62,500 per month to meet house down payment goal."
+    ],
+    "behavioral_patterns": {
+      "food_delivery": "High spending (₹12,890 last month), identified as a significant area for potential savings."
+    },
+    "reminders_set": [
+      {
+        "date": "2025-11-25",
+        "content": "Transfer ₹30,000 to your house fund"
+      }
+    ],
+    "session_summary": "Priya inquired about purchasing a MacBook, but was advised against it due to its conflict with her existing house down payment goal and current financial commitments."
+  }
+}
