@@ -33,7 +33,7 @@ python agent.py --session 2   →   1 turn    →   memory.json updated
 │    ReAct Loop  ←────────────────────────────────┐          │
 │         │                                       │          │
 │         ▼                                       │          │
-│    Gemini 2.5 Flash                             │          │
+│    Llama 3.3 70B (Groq)                         │          │
 │         │                                       │          │
 │    function_call?  ──yes──▶  execute_tool()     │          │
 │         │                   (pure Python)       │          │
@@ -57,9 +57,9 @@ FinMem/
 ├── tools.py          ← provided mock banking API (do not modify)
 ├── memory.json       ← created at runtime after Session 1; persists between sessions
 ├── sessions.md       ← provided reference for exact user messages
-├── requirements.txt  ← google-generativeai, python-dotenv
+├── requirements.txt  ← groq, python-dotenv
 ├── ARCHITECTURE.md   ← full design doc written before implementation
-└── .env              ← GEMINI_API_KEY=your_key (not committed)
+└── .env              ← GROQ_API_KEY=your_key (not committed)
 ```
 
 **Why one file for all agent code:** the assignment is under 300 lines total. A single `agent.py` is fully auditable top-to-bottom in 5 minutes. No "where does this get called?" — you see it all in one scroll.
@@ -76,15 +76,16 @@ cd FinMem
 pip install -r requirements.txt
 ```
 
-**2. Get a Gemini API key**
+**2. Get a Groq API key**
 
-- Go to [Google AI Studio](https://aistudio.google.com)
-- Create an API key (free tier: 1,500 requests/day)
+- Go to [console.groq.com](https://console.groq.com)
+- Sign up → `API Keys` → `Create API Key`
+- Free tier: **14,400 requests/day** — no quota issues
 
 **3. Create your `.env` file**
 
 ```
-GEMINI_API_KEY=your_key_here
+GROQ_API_KEY=your_key_here
 ```
 
 ---
@@ -184,7 +185,7 @@ Memory is a single `memory.json` file with two tiers:
 All tool execution is pure Python — zero LLM involvement in computation.
 
 ```
-Gemini says: call get_recent_transactions(days=35)
+LLM says: call get_recent_transactions(days=35)
                           │
                           ▼
          execute_tool("get_recent_transactions", {"days": 35})
@@ -200,7 +201,7 @@ Gemini says: call get_recent_transactions(days=35)
          "Food delivery total: ₹12,890 — Oct 3 Swiggy ₹1,200, ..."
                           │
                           ▼
-                 returned to Gemini as a string
+                 returned to LLM as a string
 ```
 
 **Operations done in code, never LLM:**
@@ -272,7 +273,7 @@ When Priya asks *"Should I buy the MacBook for ₹80,000?"*:
 
 ```
 Step 1 — Memory already in system prompt:
-  "Transfer ₹30,000 to house fund by Nov 25"  ← Gemini sees this before responding
+  "Transfer ₹30,000 to house fund by Nov 25"  ← LLM sees this before responding
 
 Step 2 — Tool: get_account_balance()
   Thursday balance: ₹99,820  (Monday was ₹1,28,000 — rent paid since then)
@@ -293,7 +294,7 @@ Step 5 — Python synthesis in execute_tool():
 Step 6 — Tool: set_reminder("2025-12-01", "Revisit MacBook purchase...")
   Proactively set — agent deferred a decision, per tool schema rule 3
 
-Step 7 — Gemini synthesizes final response:
+Step 7 — LLM synthesizes final response:
   "₹80,000 MacBook is technically buyable, but only by skipping your
    ₹30,000 house fund transfer due Nov 25. Food delivery is also tracking
    worse than your ₹6,445 target. Recommend waiting until December — 
@@ -321,14 +322,14 @@ Step 7 — Gemini synthesizes final response:
 
 ## Model
 
-**Gemini 2.5 Flash** via Google AI Studio.
+**Llama 3.3 70B Versatile** via Groq.
 
-- Free tier: 1,500 requests/day
-- Native function calling with schema validation
-- 1M token context window
+- Free tier: **14,400 requests/day** — no quota issues
+- Native OpenAI-compatible tool calling
+- 128K token context window
 - Session 1 uses ~8–12 API calls; Session 2 uses ~4–6 — well within free tier
 
-Rate-limit handling: exponential backoff at 15s → 45s → 90s before raising.
+2-second delay between requests to stay within rate limits.
 
 ---
 

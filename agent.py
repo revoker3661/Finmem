@@ -2,17 +2,15 @@
 import os, sys, json, argparse, time
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-import google.generativeai as genai
-from google.api_core.exceptions import ResourceExhausted
+from groq import Groq
 import tools as mock_tools
 
-# Force UTF-8 on Windows so ₹ prints correctly
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
 
-load_dotenv()
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-MODEL = "gemini-2.5-flash"
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), override=True)
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+MODEL  = "llama-3.3-70b-versatile"
 
 # ── SECTION 1: Constants ──────────────────────────────────────────────────────
 
@@ -38,43 +36,35 @@ SESSIONS = {
     ],
 }
 
-# Tool schemas: descriptions engineered to enforce data-freshness discipline
-_TOOLS = genai.protos.Tool(function_declarations=[
-    genai.protos.FunctionDeclaration(
-        name="get_account_balance",
-        description="Get CURRENT balances. ALWAYS call this — never use a balance from a previous session, it will be stale.",
-        parameters=genai.protos.Schema(type=genai.protos.Type.OBJECT, properties={}),
-    ),
-    genai.protos.FunctionDeclaration(
-        name="get_upcoming_bills",
-        description="Get bills due in the next N days. ALWAYS call before assessing savings capacity — bills may have cleared since last session.",
-        parameters=genai.protos.Schema(
-            type=genai.protos.Type.OBJECT,
-            properties={"days": genai.protos.Schema(type=genai.protos.Type.INTEGER, description="Days ahead. Default 30.")},
-        ),
-    ),
-    genai.protos.FunctionDeclaration(
-        name="get_recent_transactions",
-        description="Fetch transactions from the last N days. Use days=35 for a full previous month. Returns debits (negative) and credits (positive) in INR.",
-        parameters=genai.protos.Schema(
-            type=genai.protos.Type.OBJECT,
-            properties={"days": genai.protos.Schema(type=genai.protos.Type.INTEGER, description="Days to look back.")},
-            required=["days"],
-        ),
-    ),
-    genai.protos.FunctionDeclaration(
-        name="set_reminder",
-        description="Schedule a reminder. Call when: (1) user requests one, (2) a time-sensitive action needs flagging, OR (3) you recommend deferring a financial decision — always set a concrete date to revisit it.",
-        parameters=genai.protos.Schema(
-            type=genai.protos.Type.OBJECT,
-            properties={
-                "date":    genai.protos.Schema(type=genai.protos.Type.STRING, description="YYYY-MM-DD"),
-                "content": genai.protos.Schema(type=genai.protos.Type.STRING, description="Reminder text. Be specific."),
-            },
-            required=["date", "content"],
-        ),
-    ),
-])
+_TOOLS = [
+    {"type": "function", "function": {
+        "name": "get_account_balance",
+        "description": "Get CURRENT balances. ALWAYS call this — never use a balance from a previous session, it will be stale.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    }},
+    {"type": "function", "function": {
+        "name": "get_upcoming_bills",
+        "description": "Get bills due in the next N days. ALWAYS call before assessing savings capacity — bills may have cleared since last session.",
+        "parameters": {"type": "object", "properties": {
+            "days": {"type": "integer", "description": "Days ahead. Default 30."}
+        }, "required": []},
+    }},
+    {"type": "function", "function": {
+        "name": "get_recent_transactions",
+        "description": "Fetch transactions from the last N days. Use days=35 for a full previous month. Returns debits (negative) and credits (positive) in INR.",
+        "parameters": {"type": "object", "properties": {
+            "days": {"type": "integer", "description": "Days to look back."}
+        }, "required": ["days"]},
+    }},
+    {"type": "function", "function": {
+        "name": "set_reminder",
+        "description": "Schedule a reminder. Call when: (1) user requests one, (2) a time-sensitive action needs flagging, OR (3) you recommend deferring a financial decision — always set a concrete date to revisit it.",
+        "parameters": {"type": "object", "properties": {
+            "date":    {"type": "string", "description": "YYYY-MM-DD"},
+            "content": {"type": "string", "description": "Reminder text. Be specific."},
+        }, "required": ["date", "content"]},
+    }},
+]
 
 # ── SECTION 2: Tool Dispatcher (zero LLM calls) ───────────────────────────────
 
@@ -83,7 +73,7 @@ def _inr(amount: int) -> str:
 
 def execute_tool(name: str, args: dict, log: list) -> str:
     """Execute tool in pure Python. Pre-processes results so LLM never does arithmetic."""
-    # Normalize floats Gemini sometimes sends (e.g. days=35.0 → 35)
+    args = args or {}
     args = {k: int(v) if isinstance(v, float) and v == int(v) else v for k, v in args.items()}
     log.append(name)
     print(f"\n  [TOOL] {name}({args})")
@@ -105,12 +95,10 @@ def execute_tool(name: str, args: dict, log: list) -> str:
         session_dt = datetime(2025, 11, 3 if mock_tools.CURRENT_SESSION == 1 else 6)
         cutoff = (session_dt - timedelta(days=days)).strftime("%Y-%m-%d")
         txns = [t for t in mock_tools.get_recent_transactions(days) if t["date"] > cutoff]
-
         by_cat: dict = {}
         for t in txns:
             by_cat[t["category"]] = by_cat.get(t["category"], 0) + t["amount"]
         cat_summary = " | ".join(f"{c}: {_inr(v)}" for c, v in sorted(by_cat.items()))
-
         food = [t for t in txns if t["category"] == "food_delivery"]
         food_total = sum(t["amount"] for t in food)      # arithmetic in code
         food_detail = ", ".join(f"{t['date']} {t['merchant']} {_inr(t['amount'])}" for t in food)
@@ -145,10 +133,7 @@ def save_memory(data: dict) -> None:
 # ── SECTION 4: System Prompt Builder ─────────────────────────────────────────
 
 def build_system_prompt(memory: dict, session: int) -> str:
-    """
-    Injects only SEMANTIC memory (decisions, not numbers) into the prompt.
-    Raw balances / bill amounts from prior sessions are structurally absent.
-    """
+    """Injects only SEMANTIC memory (decisions, not numbers) into the prompt."""
     s = memory.get("semantic", {})
     prompt = f"""You are Priya's personal finance companion. She trusts you to help her make smart, grounded money decisions.
 
@@ -166,19 +151,17 @@ STYLE: Direct. Lead with the number. Use ₹ with exact figures. No excessive he
     if not s:
         return prompt
 
-    # Session 2+: inject structured decisions — decisions don't go stale, numbers do
     mem_lines = ["\n\nMEMORY FROM PREVIOUS SESSION:"]
     if s.get("commitments"):
-        mem_lines += ["  Commitments:"] + [f"    • {c}" for c in s["commitments"]]
+        mem_lines += ["  Commitments:"] + [f"    * {c}" for c in s["commitments"]]
     if s.get("goals"):
-        mem_lines += ["  Goals:"] + [f"    • {g}" for g in s["goals"]]
+        mem_lines += ["  Goals:"] + [f"    * {g}" for g in s["goals"]]
     if s.get("behavioral_patterns"):
-        mem_lines += ["  Spending patterns:"] + [f"    • {k}: {v}" for k, v in s["behavioral_patterns"].items()]
+        mem_lines += ["  Spending patterns:"] + [f"    * {k}: {v}" for k, v in s["behavioral_patterns"].items()]
     if s.get("reminders_set"):
-        mem_lines += ["  Reminders set:"] + [f"    • {r['date']}: {r['content']}" for r in s["reminders_set"]]
+        mem_lines += ["  Reminders set:"] + [f"    * {r['date']}: {r['content']}" for r in s["reminders_set"]]
     if s.get("session_summary"):
         mem_lines.append(f"  Summary: {s['session_summary']}")
-
     mem_lines += [
         "\nDATA FRESHNESS (critical): The memory above contains DECISIONS, not current financials.",
         "Call get_account_balance() and get_upcoming_bills() fresh — those numbers have changed.",
@@ -187,31 +170,28 @@ STYLE: Direct. Lead with the number. Use ₹ with exact figures. No excessive he
     ]
     return prompt + "\n".join(mem_lines)
 
-# ── SECTION 5: Memory Consolidation ──────────────────────────────────────────
+# ── SECTION 5: LLM Call + Memory Consolidation ───────────────────────────────
 
-def _call(model, *args, **kwargs):
-    """Exponential backoff on rate-limit (free tier: 5–20 RPM/RPD depending on model)."""
-    for wait in [15, 45, 90]:
-        try:
-            return model.generate_content(*args, **kwargs)
-        except ResourceExhausted as e:
-            print(f"  [RATE LIMIT] Waiting {wait}s... ({str(e)[:60]})")
-            time.sleep(wait)
-    return model.generate_content(*args, **kwargs)  # final attempt, let it raise
+def _call(messages: list, tools=None) -> object:
+    time.sleep(2)
+    kwargs = {"model": MODEL, "messages": messages, "temperature": 0.3}
+    if tools:
+        kwargs["tools"] = tools
+    return client.chat.completions.create(**kwargs)
 
 def consolidate(history: list, memory: dict, session: int, tools_log: list) -> dict:
-    """One LLM call at session end. Judgment needed: distinguish commitments from hypotheticals."""
+    """One LLM call at session end. Extracts decisions, not numbers."""
     transcript = "\n".join(
-        f"{m['role'].upper()}: {m['parts'][0]}"
+        f"{m['role'].upper()}: {m['content']}"
         for m in history
-        if isinstance(m.get("parts", [None])[0], str) and m["role"] in ("user", "model")
+        if isinstance(m.get("content"), str) and m["role"] in ("user", "assistant")
     )
     prompt = f"""Extract structured memory from this finance conversation. Return ONLY valid JSON.
 
 Fields to extract:
   commitments: list of strings (concrete actions with amounts/dates if stated)
   goals: list of strings (financial goals, short and long term)
-  behavioral_patterns: dict (spending category → observed pattern)
+  behavioral_patterns: dict (spending category -> observed pattern)
   reminders_set: list of {{date, content}} dicts
   session_summary: one-sentence string
 
@@ -222,54 +202,43 @@ CONVERSATION:
 
 JSON:"""
 
-    model = genai.GenerativeModel(MODEL)
-    raw = _call(model, prompt).text.strip()
+    raw = _call([{"role": "user", "content": prompt}]).choices[0].message.content.strip()
     if raw.startswith("```"):
         raw = raw.split("```")[1].lstrip("json").strip()
-
     extracted = json.loads(raw)
     memory["episodic"][f"session_{session}"] = {"date": SESSION_DATES[session],
         "turns": len([m for m in history if m["role"] == "user"]) - 1, "tools_called": tools_log}
     memory["semantic"].update(extracted)
     return memory
 
-
 # ── SECTION 6: Agent Loop ─────────────────────────────────────────────────────
 
 def run_session(session: int, turns: list) -> None:
-    """ReAct loop: send message → handle tool calls → get response → repeat."""
-    memory = load_memory()
-    model  = genai.GenerativeModel(MODEL)
-    history = [
-        {"role": "user",  "parts": [build_system_prompt(memory, session)]},
-        {"role": "model", "parts": ["Understood. Ready to help Priya."]},
-    ]
-    log: list = []  # tracks tool calls for episodic memory
+    """ReAct loop: send message -> handle tool calls -> get response -> repeat."""
+    memory  = load_memory()
+    history = [{"role": "system", "content": build_system_prompt(memory, session)}]
+    log: list = []
 
     print(f"\n{'='*60}\n  SESSION {session}  —  {SESSION_DATES[session]}\n{'='*60}")
 
     for i, msg in enumerate(turns, 1):
         print(f"\n{'─'*60}\n  PRIYA [{i}]: {msg}\n{'─'*60}")
-        history.append({"role": "user", "parts": [msg]})
+        history.append({"role": "user", "content": msg})
 
         while True:
-            resp  = _call(model, history, tools=[_TOOLS],
-                          generation_config=genai.GenerationConfig(temperature=0.3))
-            parts = resp.candidates[0].content.parts
-            calls = [p for p in parts if hasattr(p, "function_call") and p.function_call.name]
+            resp     = _call(history, tools=_TOOLS)
+            msg_obj  = resp.choices[0].message
+            tool_calls = msg_obj.tool_calls or []
 
-            if calls:
-                history.append({"role": "model", "parts": parts})
-                results = [
-                    genai.protos.Part(function_response=genai.protos.FunctionResponse(
-                        name=p.function_call.name,
-                        response={"result": execute_tool(p.function_call.name, dict(p.function_call.args), log)},
-                    )) for p in calls
-                ]
-                history.append({"role": "user", "parts": results})
+            if tool_calls:
+                history.append({"role": "assistant", "content": msg_obj.content, "tool_calls": tool_calls})
+                for tc in tool_calls:
+                    args   = json.loads(tc.function.arguments or "{}")
+                    result = execute_tool(tc.function.name, args, log)
+                    history.append({"role": "tool", "tool_call_id": tc.id, "content": result})
             else:
-                text = "".join(p.text for p in parts if hasattr(p, "text"))
-                history.append({"role": "model", "parts": [text]})
+                text = msg_obj.content or ""
+                history.append({"role": "assistant", "content": text})
                 print(f"\n  AGENT: {text}")
                 break
 
@@ -282,7 +251,6 @@ def run_session(session: int, turns: list) -> None:
           f"tools={', '.join(dict.fromkeys(log))}")
     print(f"  [SUMMARY] {s.get('session_summary','')}")
     print(f"{'='*60}\n")
-
 
 # ── SECTION 7: Entry Point ────────────────────────────────────────────────────
 
